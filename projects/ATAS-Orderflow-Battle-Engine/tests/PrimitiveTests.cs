@@ -14,6 +14,9 @@ public static class PrimitiveTests
         FamilyCapsPreventDoubleCounting();
         HypothesisLibraryContainsExactly180();
         ForwardLabelsRespectDirection();
+        DeltaDivergenceRecognizesLowerLowWithImprovingDelta();
+        PocStallRecognizesPriceProbeWithoutValueMigration();
+        SmallCounterCandleDoesNotFlipStructuralLeg();
     }
 
     private static void PriorOnlyStatisticDoesNotLeakCurrentObservation()
@@ -73,9 +76,46 @@ public static class PrimitiveTests
             throw new Exception("Forward labeler did not preserve long-direction excursion semantics.");
     }
 
-    private static BarSnapshot B(DateTime t, decimal o, decimal h, decimal l, decimal c)
+    private static void DeltaDivergenceRecognizesLowerLowWithImprovingDelta()
+    {
+        var t = new DateTime(2026,8,25,14,0,0,DateTimeKind.Utc);
+        var prior = new[] {
+            B(t,100,101,98,99, -800, 99),
+            B(t.AddMinutes(1),99,100,97,98, -1400, 98),
+            B(t.AddMinutes(2),98,100,98,99, -500, 99)
+        };
+        var current = B(t.AddMinutes(3),99,100,96,99, -400, 99);
+        var r = new DeltaDivergenceDetector().Analyze(prior, current);
+        if (!r.Bullish)
+            throw new Exception("Expected bullish price/delta divergence on lower low with improving delta.");
+    }
+
+    private static void PocStallRecognizesPriceProbeWithoutValueMigration()
+    {
+        var t = new DateTime(2026,8,25,14,0,0,DateTimeKind.Utc);
+        var prior = new[] { B(t,102,103,101,102,0,102), B(t.AddMinutes(1),102,103,101,102,0,102) };
+        var current = B(t.AddMinutes(2),102,102,99,100,0,102);
+        var r = new ValueMigrationDetector().Analyze(prior, current);
+        if (!r.BullishStall)
+            throw new Exception("Expected bullish POC stall when price drops but POC does not migrate down.");
+    }
+
+    private static void SmallCounterCandleDoesNotFlipStructuralLeg()
+    {
+        var t = new DateTime(2026,8,25,14,0,0,DateTimeKind.Utc);
+        var tracker = new LegTracker { MinReversalPoints = 1m, ReversalAtrFraction = .55m };
+        tracker.Update(B(t,100,104,99,104,800,102,4));
+        tracker.Update(B(t.AddMinutes(1),104,109,103,108,900,107,4));
+        tracker.Update(B(t.AddMinutes(2),108,109,106.5m,107, -200,107,4));
+        if (tracker.CurrentDirection != FlowSide.Buy)
+            throw new Exception("Small counter candle incorrectly flipped structural leg.");
+    }
+
+    private static BarSnapshot B(DateTime t, decimal o, decimal h, decimal l, decimal c, decimal delta = 0, decimal? poc = null, decimal atr = 4)
     {
         var levels = new List<FootprintLevel> { new(l,100,30,130,10), new((h+l)/2,80,80,160,10), new(h,30,100,130,10) };
-        return new(t,o,h,l,c,210,210,0,0,0,(h+l)/2,(h+l)/2,4,levels);
+        decimal bid = 500m - delta / 2m;
+        decimal ask = 500m + delta / 2m;
+        return new(t,o,h,l,c,bid,ask,delta,delta,delta,(h+l)/2,poc ?? (h+l)/2,atr,levels);
     }
 }
