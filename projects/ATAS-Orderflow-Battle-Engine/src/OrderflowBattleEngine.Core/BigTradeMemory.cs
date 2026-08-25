@@ -30,6 +30,15 @@ public sealed class BigTradeMemory
             var t = _events[i];
             if (bar.Time < t.Event.Time) continue;
 
+            // Closed-bar historical truth cannot know whether this bar's high/low occurred
+            // before or after an intrabar cumulative-trade event. Record the event bar only;
+            // begin response classification on subsequent bars unless true tick sequencing is supplied.
+            if (t.AgeBars == 0)
+            {
+                _events[i] = t with { AgeBars = 1 };
+                continue;
+            }
+
             decimal p = t.Event.RepresentativePrice;
             decimal acceptance = Math.Max(.25m, bar.Atr > 0 ? bar.Atr * AcceptanceAtrFraction : 1m);
             decimal fav = t.FavorableExcursion;
@@ -49,10 +58,10 @@ public sealed class BigTradeMemory
                 crossedBack = bar.Close > p;
             }
 
-            bool retest = bar.Low <= t.Event.PriceHigh && bar.High >= t.Event.PriceLow && t.AgeBars > 0;
+            bool retest = bar.Low <= t.Event.PriceHigh && bar.High >= t.Event.PriceLow;
             int retests = t.Retests + (retest ? 1 : 0);
             bool sameSideClose = t.Event.Side == FlowSide.Buy ? bar.Close >= p : bar.Close <= p;
-            bool defended = t.Defended || (retest && sameSideClose && t.AgeBars >= 1);
+            bool defended = t.Defended || (retest && sameSideClose);
 
             var disposition = t.Disposition;
             if (disposition == BigTradeDisposition.Pending || disposition == BigTradeDisposition.Neutral)
