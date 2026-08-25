@@ -1,43 +1,65 @@
 # Implementation Status
 
-## Implemented now
-- isolated project folder in GitHub
-- platform-neutral C# domain model
-- persistent MarketStoryState
-- structural bias and auction modes
-- directional leg memory
-- impulse-vs-pullback quality comparison
-- persistent inventory/absorption/Big Trade zones
+## Implemented and CI-tested in the platform-neutral Core
+- persistent `MarketStoryState`
+- structural bias / auction mode state machine
+- ATR-aware structural leg tracking (ordinary counter candles do not automatically flip trend)
+- micro pullback detection inside a structural leg
+- impulse-versus-pullback quality comparison
+- persistent buyer/seller inventory, Big Trade and absorption zones
 - zone retest, defense, weakening and invalidation state
-- diagonal imbalance scanner
-- stacked imbalance scanner
+- diagonal and stacked footprint imbalance scanning
 - absorption heuristic
 - exhaustion heuristic
-- POC extraction from footprint
-- story hysteresis/decay foundation
-- bullish/bearish reload classification foundation
-- ARMED/CONFIRMED decision foundation
-- synthetic smoke test
-- ATAS adapter with GetCandle/GetAllPriceLevels integration point
-- cumulative Big Trade ingestion boundary
+- POC extraction and POC/value migration/stall logic
+- prior-only delta divergence detector
+- prior-only rolling percentile + robust MAD z-score utility
+- sweep/reclaim + failed-auction detector (sweep alone is not promoted to failed auction)
+- Big Trade response classifier: accepted / failed / absorbed / trapped / neutral
+- family-capped score/contradiction engine
+- session / trend / volatility regime model
+- bullish/bearish reload story classification
+- ARMED / CONFIRMED decision foundation
+- deterministic JSONL research logger
+- execution-neutral forward MFE/MAE labeling
+- deterministic library of 180 research hypotheses
+- dependency-free synthetic test runner
+- GitHub Actions .NET 8 CI
 
-## Not yet truthfully complete
-The ATAS adapter cannot be claimed compiled until this code is built against the exact ATAS assemblies installed on the trading PC. The following must be completed after inspecting those assemblies/examples:
-- exact cumulative-trade callback/request signatures
-- ATR series integration
-- chart rendering/arrows/panel API
-- alerts
-- historical feed capability check
-- session/value-area helpers
-- robust prior-only percentile engine
-- full Big Trade response classifier
-- failed auction / sweep-reclaim detector
-- cumulative delta divergence
-- research SQLite logger
-- 180-hypothesis runner and best-five optimizer
-- walk-forward harness
+## ATAS adapter implemented from current official API documentation
+- `GetCandle(bar)` footprint extraction
+- `GetAllPriceLevels()` price-level conversion
+- candle Bid / Ask / Delta / MaxDelta / MinDelta / VWAP ingestion
+- live `OnCumulativeTrade` handling
+- `OnUpdateCumulativeTrade` handling without treating every update as a fresh event
+- historical `RequestForCumulativeTrades`
+- <=7-day historical request limitation respected using non-overlapping 6-day chunks
+- `OnCumulativeTradesResponse` history ingestion
+- chronological prior-only Big Trade percentile reconstruction
+- guarded recalculation after cumulative-trade history arrives
 
-## Important
-The Core is intentionally separated from ATAS so market-story logic can be unit-tested and researched without UI/feed coupling.
+## Still required before calling the ATAS indicator production-ready
+The ATAS-specific project cannot be truthfully claimed compiled until it is built against the exact ATAS assemblies installed on the trading PC.
 
-No profitability result exists yet and none should be inferred from implementation progress.
+Remaining major work:
+- wire real prior-only ATR into the ATAS adapter (currently Core supports ATR but adapter placeholder is zero)
+- verify every ATAS cumulative-trade member/signature against installed assemblies
+- optimize historical Big Trade lookup/bucketing for large datasets
+- chart rendering: BUY/SELL/ARMED markers, reasons, zones and battle panel
+- ATAS alerts
+- session timezone/exchange-session validation
+- richer value-area / session profile context from installed feed/API
+- cumulative-delta state and divergence
+- explicit Big Trade defense/retest classifier integrated into narrative state
+- research database (SQLite) in addition to JSONL
+- 180-hypothesis execution/screening harness over real historical data
+- best-five deep optimization + ablations
+- walk-forward validation and untouched final test
+- score calibration
+- no-repaint replay verification inside ATAS
+
+## CI status
+The Core project is continuously built and its deterministic tests run through `.github/workflows/atas-orderflow-core.yml`. CI has already caught and forced correction of a real footprint compile error, which is why new Core changes must stay green before being trusted.
+
+## Truth statement
+No profitability, win-rate or accuracy claim exists yet. Implementation progress is not evidence of trading edge. Real historical/replay research and out-of-sample validation remain mandatory.
