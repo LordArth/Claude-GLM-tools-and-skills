@@ -17,6 +17,9 @@ public static class PrimitiveTests
         DeltaDivergenceRecognizesLowerLowWithImprovingDelta();
         PocStallRecognizesPriceProbeWithoutValueMigration();
         SmallCounterCandleDoesNotFlipStructuralLeg();
+        ProspectiveCooldownIsOutcomeBlindAndDeterministic();
+        ProspectiveEvaluatorKeepsSidesSeparate();
+        MatchedControlProducesPairedDiagnostics();
     }
 
     private static void PriorOnlyStatisticDoesNotLeakCurrentObservation()
@@ -109,6 +112,56 @@ public static class PrimitiveTests
         tracker.Update(B(t.AddMinutes(2),108,109,106.5m,107, -200,107,4));
         if (tracker.CurrentDirection != FlowSide.Buy)
             throw new Exception("Small counter candle incorrectly flipped structural leg.");
+    }
+
+    private static void ProspectiveCooldownIsOutcomeBlindAndDeterministic()
+    {
+        var t = new DateTime(2026,8,25,14,0,0,DateTimeKind.Utc);
+        var events = new[] {
+            new ResearchEvent("B", t.AddMinutes(1), "S1", FlowSide.Buy, 11, 100, 80),
+            new ResearchEvent("A", t, "S1", FlowSide.Sell, 10, 100, 40),
+            new ResearchEvent("C", t.AddMinutes(30), "S1", FlowSide.Buy, 31, 100, 99)
+        };
+        var kept = new ProspectiveEvaluator().ApplyOutcomeBlindCooldown(events);
+        if (kept.Count != 2 || kept[0].Id != "A" || kept[1].Id != "C")
+            throw new Exception("Cooldown used score/outcome or failed deterministic first-event retention.");
+    }
+
+    private static void ProspectiveEvaluatorKeepsSidesSeparate()
+    {
+        var t = new DateTime(2026,8,25,14,0,0,DateTimeKind.Utc);
+        var bars = new List<BarSnapshot>();
+        decimal p = 100;
+        for (int i=0;i<70;i++)
+        {
+            decimal next = i < 30 ? p + 1 : p - 1;
+            bars.Add(B(t.AddMinutes(i), p, Math.Max(p,next)+1, Math.Min(p,next)-1, next));
+            p = next;
+        }
+        var events = new[] {
+            new ResearchEvent("L1", t.AddMinutes(5), "S1", FlowSide.Buy, 5, bars[6].Open, 80),
+            new ResearchEvent("S1", t.AddMinutes(35), "S2", FlowSide.Sell, 35, bars[36].Open, 80)
+        };
+        var eval = new ProspectiveEvaluator(ProspectiveProtocol.FrozenV1 with { CooldownBars = 1 }).Evaluate(bars, events);
+        if (eval.Buy.N != 1 || eval.Sell.N != 1)
+            throw new Exception("Prospective evaluator merged or dropped side-specific statistics.");
+    }
+
+    private static void MatchedControlProducesPairedDiagnostics()
+    {
+        var t = new DateTime(2026,8,25,14,0,0,DateTimeKind.Utc);
+        var bars = new List<BarSnapshot>();
+        decimal p = 100;
+        for (int i=0;i<60;i++)
+        {
+            decimal next = p + (i < 25 ? 1 : -1);
+            bars.Add(B(t.AddMinutes(i), p, Math.Max(p,next)+1, Math.Min(p,next)-1, next));
+            p = next;
+        }
+        var events = new[] { new ResearchEvent("E1", t.AddMinutes(10), "S1", FlowSide.Buy, 10, bars[11].Open, 75) };
+        var r = new HypothesisScreeningRunner(ProspectiveProtocol.FrozenV1 with { CooldownBars = 1 }).CompareWithPriceOnlyControl(bars, events);
+        if (r.N != 1)
+            throw new Exception("Matched price-only control did not produce one paired observation.");
     }
 
     private static BarSnapshot B(DateTime t, decimal o, decimal h, decimal l, decimal c, decimal delta = 0, decimal? poc = null, decimal atr = 4)
