@@ -34,7 +34,7 @@ public sealed class FootprintAnalyzer
         double bullAbs=Math.Clamp((double)(lowSell/total)*2.5*lowerReject,0,1);
         double bearAbs=Math.Clamp((double)(highBuy/total)*2.5*upperReject,0,1);
 
-        double bullEx=Exhaustion(low.Reverse().Select(x=>(double)x.Bid).ToArray());
+        double bullEx=Exhaustion(low.AsEnumerable().Reverse().Select(x=>(double)x.Bid).ToArray());
         double bearEx=Exhaustion(high.Select(x=>(double)x.Ask).ToArray());
         decimal poc=levels.OrderByDescending(x=>x.Volume).First().Price;
         return new(ask,bid,maxAsk,maxBid,bullAbs,bearAbs,bullEx,bearEx,poc);
