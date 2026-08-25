@@ -12,6 +12,9 @@ public sealed class NarrativeEngine
     private readonly LegTracker _legTracker = new();
     private readonly PullbackAnalyzer _pullbacks = new();
     private readonly AuctionFailureDetector _auction = new();
+    private readonly DeltaDivergenceDetector _deltaDivergence = new();
+    private readonly ValueMigrationDetector _valueMigration = new();
+    private readonly RegimeEngine _regimes = new();
     private readonly List<BarSnapshot> _bars = new();
     private readonly List<MemoryZone> _zones = new();
     private readonly List<NarrativeTransition> _transitions = new();
@@ -21,18 +24,23 @@ public sealed class NarrativeEngine
 
     public EngineDecision OnClosedBar(BarSnapshot bar, IReadOnlyList<BigTradeEvent>? bigTrades = null)
     {
-        decimal? priorLow = _bars.Count == 0 ? null : _bars.TakeLast(Math.Min(20, _bars.Count)).Min(x => x.Low);
-        decimal? priorHigh = _bars.Count == 0 ? null : _bars.TakeLast(Math.Min(20, _bars.Count)).Max(x => x.High);
+        var priorBars = _bars.ToArray();
+        decimal? priorLow = priorBars.Length == 0 ? null : priorBars.TakeLast(Math.Min(20, priorBars.Length)).Min(x => x.Low);
+        decimal? priorHigh = priorBars.Length == 0 ? null : priorBars.TakeLast(Math.Min(20, priorBars.Length)).Max(x => x.High);
+
+        var fp = _footprint.Analyze(bar);
+        var deltaDiv = _deltaDivergence.Analyze(priorBars, bar);
+        var value = _valueMigration.Analyze(priorBars, bar);
 
         _bars.Add(bar);
         if (_bars.Count > 500) _bars.RemoveAt(0);
 
-        var fp = _footprint.Analyze(bar);
         _legTracker.Update(bar);
         var legs = _legTracker.Legs;
         var current = legs.Count > 0 ? legs[^1] : null;
         var pullback = _pullbacks.Analyze(_bars, current);
         var auction = _auction.Analyze(bar, priorLow, priorHigh, fp);
+        var regime = _regimes.Update(bar, legs);
         var trades = bigTrades ?? Array.Empty<BigTradeEvent>();
         UpdateZones(bar, fp, trades);
 
@@ -59,6 +67,10 @@ public sealed class NarrativeEngine
         if (fp.MaxBidStack >= 3) { bear += 8; reasons.Add("SBI"); }
         if (auction.BullishFailedAuction) { bull += auction.BullStrength * .18; reasons.Add("FA_BUY"); }
         if (auction.BearishFailedAuction) { bear += auction.BearStrength * .18; reasons.Add("FA_SELL"); }
+        if (deltaDiv.Bullish) { bull += deltaDiv.BullStrength * .10; reasons.Add("DDIV_BUY"); }
+        if (deltaDiv.Bearish) { bear += deltaDiv.BearStrength * .10; reasons.Add("DDIV_SELL"); }
+        if (value.BullishStall) { bull += value.Strength * .08; reasons.Add("POC_STALL_BUY"); }
+        if (value.BearishStall) { bear += value.Strength * .08; reasons.Add("POC_STALL_SELL"); }
 
         bool bullPullback = pullback.IsCounterMove && pullback.ParentDirection == FlowSide.Buy;
         bool bearPullback = pullback.IsCounterMove && pullback.ParentDirection == FlowSide.Sell;
@@ -73,13 +85,16 @@ public sealed class NarrativeEngine
             if (IsInOwnedZone(bar.Close, FlowSide.Buy)) { bull += 12; reload += 12; reasons.Add("BUYER_ZONE"); }
             if (fp.BullAbsorption > .45) reload += 25;
             if (auction.BullishFailedAuction) reload += 18;
+            if (deltaDiv.Bullish) reload += Math.Min(12, deltaDiv.BullStrength * .12);
+            if (value.BullishStall) reload += Math.Min(10, value.Strength * .10);
+            if (value.PocDown) damage += 10;
             if (trades.Any(x => x.Side == FlowSide.Sell && x.PriorPercentile >= .99) && fp.BullAbsorption > .45)
             {
                 reload += 10;
                 reasons.Add("BIG_SELL_ABSORBED_CANDIDATE");
             }
             reload += pullbackQuality * .45;
-            damage = Math.Max(0, 100 - pullbackQuality);
+            damage += Math.Max(0, 100 - pullbackQuality);
         }
         else if (bearPullback)
         {
@@ -88,18 +103,30 @@ public sealed class NarrativeEngine
             if (IsInOwnedZone(bar.Close, FlowSide.Sell)) { bear += 12; reload += 12; reasons.Add("SELLER_ZONE"); }
             if (fp.BearAbsorption > .45) reload += 25;
             if (auction.BearishFailedAuction) reload += 18;
+            if (deltaDiv.Bearish) reload += Math.Min(12, deltaDiv.BearStrength * .12);
+            if (value.BearishStall) reload += Math.Min(10, value.Strength * .10);
+            if (value.PocUp) damage += 10;
             if (trades.Any(x => x.Side == FlowSide.Buy && x.PriorPercentile >= .99) && fp.BearAbsorption > .45)
             {
                 reload += 10;
                 reasons.Add("BIG_BUY_ABSORBED_CANDIDATE");
             }
             reload += pullbackQuality * .45;
-            damage = Math.Max(0, 100 - pullbackQuality);
+            damage += Math.Max(0, 100 - pullbackQuality);
+        }
+
+        // Extreme volatility makes a raw pullback classification less trustworthy unless the
+        // auction has already shown rejection/absorption. Penalize rather than hard-veto.
+        if (regime.Volatility == VolatilityRegime.Extreme && !auction.BullishFailedAuction && !auction.BearishFailedAuction)
+        {
+            reload = Math.Max(0, reload - 12);
+            reasons.Add("EXTREME_VOL_PENALTY");
         }
 
         bull = Math.Clamp(bull, 0, 100);
         bear = Math.Clamp(bear, 0, 100);
         reload = Math.Clamp(reload, 0, 100);
+        damage = Math.Clamp(damage, 0, 100);
 
         var bias = bull - bear > 25 ? StructuralBias.StrongBull
             : bull - bear > 10 ? StructuralBias.Bull
@@ -113,11 +140,11 @@ public sealed class NarrativeEngine
         if (_transitions.Count > 100) _transitions.RemoveAt(0);
 
         var scores = new StoryScores(bull, bear, Math.Clamp(100 - damage, 0, 100), pullbackQuality, reload,
-            Math.Clamp(damage, 0, 100), Math.Max(bull, bear));
+            damage, Math.Max(bull, bear));
 
         _story = new(bar.Time, bias, mode, scores, legs.TakeLast(8).ToArray(),
             _zones.Where(z => z.Status is ZoneStatus.Active or ZoneStatus.Defended or ZoneStatus.Weakening).ToArray(),
-            _transitions.TakeLast(20).ToArray(), bull, bear);
+            _transitions.TakeLast(20).ToArray(), bull, bear, regime);
 
         FlowSide dir = FlowSide.Unknown;
         double score = 0;
