@@ -36,7 +36,7 @@ public sealed record StoryScores(double BuyerControl, double SellerControl, doub
     public static StoryScores Neutral => new(50,50,50,0,0,0,0);
 }
 
-public sealed record MarketStoryState(DateTime Time, StructuralBias Bias, AuctionMode Mode, StoryScores Scores, IReadOnlyList<MarketLeg> RecentLegs, IReadOnlyList<MemoryZone> ActiveZones, IReadOnlyList<NarrativeTransition> Transitions, double BullConfidence, double BearConfidence)
+public sealed record MarketStoryState(DateTime Time, StructuralBias Bias, AuctionMode Mode, StoryScores Scores, IReadOnlyList<MarketLeg> RecentLegs, IReadOnlyList<MemoryZone> ActiveZones, IReadOnlyList<NarrativeTransition> Transitions, double BullConfidence, double BearConfidence, RegimeState? Regime = null)
 {
-    public static MarketStoryState Empty(DateTime time) => new(time, StructuralBias.Neutral, AuctionMode.Balanced, StoryScores.Neutral, Array.Empty<MarketLeg>(), Array.Empty<MemoryZone>(), Array.Empty<NarrativeTransition>(), 0, 0);
+    public static MarketStoryState Empty(DateTime time) => new(time, StructuralBias.Neutral, AuctionMode.Balanced, StoryScores.Neutral, Array.Empty<MarketLeg>(), Array.Empty<MemoryZone>(), Array.Empty<NarrativeTransition>(), 0, 0, null);
 }
