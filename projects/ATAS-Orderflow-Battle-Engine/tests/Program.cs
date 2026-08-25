@@ -10,6 +10,7 @@ public static class Program
         {
             NarrativeEngineSyntheticTests.RunAll();
             PrimitiveTests.RunAll();
+            CausalEngineTests.RunAll();
             Console.WriteLine("All core tests passed.");
             return 0;
         }
