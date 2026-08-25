@@ -62,18 +62,20 @@ public class OrderflowBattleIndicator : Indicator
         if (_historicalLoaded || CurrentBar <= 0)
             return;
 
-        var begin = GetCandle(0).Time;
+        var from = GetCandle(0).Time;
         var end = GetCandle(CurrentBar - 1).LastTime;
 
-        // ATAS currently limits a cumulative-trade request to no more than seven days.
-        // Use six-day chunks to remain safely inside that limit.
-        for (var from = begin; from < end; from = from.AddDays(6))
+        // ATAS currently limits a cumulative-trade request to <= 7 days.
+        // Six-day non-overlapping chunks avoid duplicate boundary events.
+        while (from <= end)
         {
             var to = from.AddDays(6);
             if (to > end) to = end;
             var request = new CumulativeTradesRequest(from, to, 0, 0);
             _pendingRequestIds.Add(request.RequestId);
             RequestForCumulativeTrades(request);
+            if (to >= end) break;
+            from = to.AddTicks(1);
         }
     }
 
@@ -84,8 +86,8 @@ public class OrderflowBattleIndicator : Indicator
 
         lock (_tradeGate)
         {
-            foreach (var trade in cumulativeTrades.OrderBy(x => x.Time))
-                _historicalTrades.Add(ConvertTrade(trade));
+            foreach (var trade in cumulativeTrades)
+                _historicalTrades.Add(ConvertRawTrade(trade));
         }
 
         if (_pendingRequestIds.Count == 0)
@@ -93,10 +95,18 @@ public class OrderflowBattleIndicator : Indicator
             lock (_tradeGate)
             {
                 _historicalTrades.Sort((a,b) => a.Time.CompareTo(b.Time));
+                _bigTradeVolume.Reset();
+                for (int i = 0; i < _historicalTrades.Count; i++)
+                {
+                    var evt = _historicalTrades[i];
+                    var observation = _bigTradeVolume.ObserveThenAdd((double)evt.Volume);
+                    _historicalTrades[i] = evt with { PriorPercentile = observation.PriorPercentile };
+                }
             }
+
             _historicalLoaded = true;
 
-            // Re-run the bars once history exists. Guard prevents request recursion.
+            // Re-run bars exactly once now that the historical event stream exists.
             if (!_recalcRequestedAfterHistory)
             {
                 _recalcRequestedAfterHistory = true;
@@ -107,24 +117,32 @@ public class OrderflowBattleIndicator : Indicator
 
     private void UpsertLiveTrade(CumulativeTrade trade)
     {
-        var converted = ConvertTrade(trade);
+        var raw = ConvertRawTrade(trade);
+        var percentile = _bigTradeVolume.PercentileOf((double)raw.Volume);
+        var converted = raw with { PriorPercentile = percentile };
+
         lock (_tradeGate)
         {
-            // Cumulative trades may update as additional prints are aggregated. Replace the
-            // same event key instead of counting every update as a fresh Big Trade.
+            // Updates to one cumulative event replace it; only genuinely new events enter
+            // the rolling distribution, avoiding update-volume double counting.
             int index = _liveTrades.FindIndex(x => x.Time == converted.Time && x.Side == converted.Side && x.PriceLow == converted.PriceLow);
-            if (index >= 0) _liveTrades[index] = converted;
-            else _liveTrades.Add(converted);
+            if (index >= 0)
+            {
+                _liveTrades[index] = converted;
+            }
+            else
+            {
+                _liveTrades.Add(converted);
+                _bigTradeVolume.ObserveThenAdd((double)converted.Volume);
+            }
         }
     }
 
-    private BigTradeEvent ConvertTrade(CumulativeTrade trade)
+    private static BigTradeEvent ConvertRawTrade(CumulativeTrade trade)
     {
         var lo = Math.Min(trade.FirstPrice, trade.Lastprice);
         var hi = Math.Max(trade.FirstPrice, trade.Lastprice);
-        var percentile = _bigTradeVolume.PercentileOf((double)trade.Volume);
-        _bigTradeVolume.ObserveThenAdd((double)trade.Volume);
         var side = trade.Direction == TradeDirection.Buy ? FlowSide.Buy : FlowSide.Sell;
-        return new BigTradeEvent(Guid.NewGuid(), trade.Time, side, trade.Volume, lo, hi, (lo + hi) / 2m, percentile);
+        return new BigTradeEvent(Guid.NewGuid(), trade.Time, side, trade.Volume, lo, hi, (lo + hi) / 2m, 0.0);
     }
 }
