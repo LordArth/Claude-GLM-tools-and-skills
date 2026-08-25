@@ -1,22 +1,23 @@
-// Compile this project against the ATAS assemblies installed on the trading PC.
-// Exact installed SDK signatures are the final authority; this adapter intentionally keeps
-// platform-specific code isolated from the deterministic Core engine.
-
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using ATAS.Indicators;
-using ATAS.Indicators.Technical;
-using ATAS.DataFeedsCore;
 using OrderflowBattleEngine.Core;
 
 namespace OrderflowBattleEngine.ATAS;
 
+// This project must be compiled against the exact ATAS assemblies installed on the trading PC.
+// The cumulative-trade hooks below follow the current official ATAS Indicator API.
 public class OrderflowBattleIndicator : Indicator
 {
     private readonly NarrativeEngine _engine = new();
     private readonly object _tradeGate = new();
-    private readonly List<BigTradeEvent> _pendingBigTrades = new();
+    private readonly List<BigTradeEvent> _liveTrades = new();
+    private readonly List<BigTradeEvent> _historicalTrades = new();
+    private readonly HashSet<int> _pendingRequestIds = new();
+    private readonly PriorOnlyStatistics _bigTradeVolume = new(3000);
+    private bool _historicalLoaded;
+    private bool _recalcRequestedAfterHistory;
 
     public OrderflowBattleIndicator() : base(true)
     {
@@ -26,40 +27,104 @@ public class OrderflowBattleIndicator : Indicator
     protected override void OnCalculate(int bar, decimal value)
     {
         if (bar < 1) return;
+
         var c = GetCandle(bar);
         var levels = c.GetAllPriceLevels()
+            .Where(x => x != null)
             .Select(x => new FootprintLevel(x.Price, x.Bid, x.Ask, x.Volume, x.Ticks))
             .OrderBy(x => x.Price)
             .ToArray();
 
         decimal poc = levels.Length == 0 ? c.Close : levels.OrderByDescending(x => x.Volume).First().Price;
-        // ATR is intentionally zero until wired to a prior-only ATR series in the installed SDK build.
         var snapshot = new BarSnapshot(c.Time, c.Open, c.High, c.Low, c.Close, c.Bid, c.Ask, c.Delta,
             c.MaxDelta, c.MinDelta, c.VWAP, poc, 0m, levels);
 
         BigTradeEvent[] trades;
         lock (_tradeGate)
         {
-            trades = _pendingBigTrades.Where(x => x.Time <= c.LastTime).ToArray();
-            _pendingBigTrades.RemoveAll(x => x.Time <= c.LastTime);
+            var source = _historicalLoaded ? _historicalTrades : _liveTrades;
+            trades = source.Where(x => x.Time >= c.Time && x.Time <= c.LastTime).ToArray();
+            if (!_historicalLoaded)
+                _liveTrades.RemoveAll(x => x.Time <= c.LastTime);
         }
 
-        // Closed-bar truth: only finalize bar N after bar N+1 exists.
+        // Closed-bar truth: the latest in-progress bar is not finalized.
         if (bar < CurrentBar - 1)
             _engine.OnClosedBar(snapshot, trades);
-
-        // Rendering is deliberately separated from research truth. Wire arrows/text after
-        // installed-ATAS compilation verifies the drawing API version.
     }
 
-    // Wire these callbacks to the exact cumulative-trade overrides/events exposed by the
-    // installed ATAS version. Official ATAS API supports historical cumulative-trade requests
-    // and CumulativeTrade objects containing direction, volume, price and timestamps.
-    private void AcceptCumulativeTrade(DateTime time, bool isBuy, decimal volume, decimal firstPrice, decimal lastPrice)
+    protected override void OnCumulativeTrade(CumulativeTrade trade) => UpsertLiveTrade(trade);
+
+    protected override void OnUpdateCumulativeTrade(CumulativeTrade trade) => UpsertLiveTrade(trade);
+
+    protected override void OnFinishRecalculate()
     {
-        var lo = Math.Min(firstPrice, lastPrice); var hi = Math.Max(firstPrice, lastPrice);
-        var evt = new BigTradeEvent(Guid.NewGuid(), time, isBuy ? FlowSide.Buy : FlowSide.Sell,
-            volume, lo, hi, (lo + hi) / 2m, 0.0);
-        lock (_tradeGate) _pendingBigTrades.Add(evt);
+        if (_historicalLoaded || CurrentBar <= 0)
+            return;
+
+        var begin = GetCandle(0).Time;
+        var end = GetCandle(CurrentBar - 1).LastTime;
+
+        // ATAS currently limits a cumulative-trade request to no more than seven days.
+        // Use six-day chunks to remain safely inside that limit.
+        for (var from = begin; from < end; from = from.AddDays(6))
+        {
+            var to = from.AddDays(6);
+            if (to > end) to = end;
+            var request = new CumulativeTradesRequest(from, to, 0, 0);
+            _pendingRequestIds.Add(request.RequestId);
+            RequestForCumulativeTrades(request);
+        }
+    }
+
+    protected override void OnCumulativeTradesResponse(CumulativeTradesRequest request, IEnumerable<CumulativeTrade> cumulativeTrades)
+    {
+        if (!_pendingRequestIds.Remove(request.RequestId))
+            return;
+
+        lock (_tradeGate)
+        {
+            foreach (var trade in cumulativeTrades.OrderBy(x => x.Time))
+                _historicalTrades.Add(ConvertTrade(trade));
+        }
+
+        if (_pendingRequestIds.Count == 0)
+        {
+            lock (_tradeGate)
+            {
+                _historicalTrades.Sort((a,b) => a.Time.CompareTo(b.Time));
+            }
+            _historicalLoaded = true;
+
+            // Re-run the bars once history exists. Guard prevents request recursion.
+            if (!_recalcRequestedAfterHistory)
+            {
+                _recalcRequestedAfterHistory = true;
+                RecalculateValues();
+            }
+        }
+    }
+
+    private void UpsertLiveTrade(CumulativeTrade trade)
+    {
+        var converted = ConvertTrade(trade);
+        lock (_tradeGate)
+        {
+            // Cumulative trades may update as additional prints are aggregated. Replace the
+            // same event key instead of counting every update as a fresh Big Trade.
+            int index = _liveTrades.FindIndex(x => x.Time == converted.Time && x.Side == converted.Side && x.PriceLow == converted.PriceLow);
+            if (index >= 0) _liveTrades[index] = converted;
+            else _liveTrades.Add(converted);
+        }
+    }
+
+    private BigTradeEvent ConvertTrade(CumulativeTrade trade)
+    {
+        var lo = Math.Min(trade.FirstPrice, trade.Lastprice);
+        var hi = Math.Max(trade.FirstPrice, trade.Lastprice);
+        var percentile = _bigTradeVolume.PercentileOf((double)trade.Volume);
+        _bigTradeVolume.ObserveThenAdd((double)trade.Volume);
+        var side = trade.Direction == TradeDirection.Buy ? FlowSide.Buy : FlowSide.Sell;
+        return new BigTradeEvent(Guid.NewGuid(), trade.Time, side, trade.Volume, lo, hi, (lo + hi) / 2m, percentile);
     }
 }
