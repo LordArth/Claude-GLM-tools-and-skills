@@ -12,6 +12,8 @@ public static class PrimitiveTests
         BigTradeCanBecomeTrapped();
         SweepRequiresReclaimForFailedAuction();
         FamilyCapsPreventDoubleCounting();
+        HypothesisLibraryContainsExactly180();
+        ForwardLabelsRespectDirection();
     }
 
     private static void PriorOnlyStatisticDoesNotLeakCurrentObservation()
@@ -54,6 +56,21 @@ public static class PrimitiveTests
         });
         if (s.LongScore > 10.0001)
             throw new Exception("Correlated aggression evidence exceeded family cap.");
+    }
+
+    private static void HypothesisLibraryContainsExactly180()
+    {
+        if (HypothesisLibrary.Build180().Count != 180)
+            throw new Exception("Research hypothesis library count changed.");
+    }
+
+    private static void ForwardLabelsRespectDirection()
+    {
+        var t = new DateTime(2026,8,25,14,0,0,DateTimeKind.Utc);
+        var bars = new[] { B(t,100,101,99,100), B(t.AddMinutes(1),100,104,99,103), B(t.AddMinutes(2),103,106,102,105) };
+        var labels = new ForwardLabeler().Label(bars, 0, FlowSide.Buy, 100, 2);
+        if (labels.Count != 1 || labels[0].Return <= 0 || labels[0].Mfe <= labels[0].Mae)
+            throw new Exception("Forward labeler did not preserve long-direction excursion semantics.");
     }
 
     private static BarSnapshot B(DateTime t, decimal o, decimal h, decimal l, decimal c)
