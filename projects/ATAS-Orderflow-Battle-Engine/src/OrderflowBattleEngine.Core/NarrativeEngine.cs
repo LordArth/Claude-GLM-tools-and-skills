@@ -15,6 +15,7 @@ public sealed class NarrativeEngine
     private readonly DeltaDivergenceDetector _deltaDivergence = new();
     private readonly ValueMigrationDetector _valueMigration = new();
     private readonly RegimeEngine _regimes = new();
+    private readonly BigTradeMemory _bigTradeMemory = new();
     private readonly List<BarSnapshot> _bars = new();
     private readonly List<MemoryZone> _zones = new();
     private readonly List<NarrativeTransition> _transitions = new();
@@ -42,7 +43,10 @@ public sealed class NarrativeEngine
         var auction = _auction.Analyze(bar, priorLow, priorHigh, fp);
         var regime = _regimes.Update(bar, legs);
         var trades = bigTrades ?? Array.Empty<BigTradeEvent>();
-        UpdateZones(bar, fp, trades);
+
+        _bigTradeMemory.Add(trades);
+        var trackedTrades = _bigTradeMemory.Update(bar);
+        UpdateZones(bar, fp, trades, trackedTrades);
 
         var prior = _story ?? MarketStoryState.Empty(bar.Time);
         var reasons = new List<string>();
@@ -72,6 +76,27 @@ public sealed class NarrativeEngine
         if (value.BullishStall) { bull += value.Strength * .08; reasons.Add("POC_STALL_BUY"); }
         if (value.BearishStall) { bear += value.Strength * .08; reasons.Add("POC_STALL_SELL"); }
 
+        var nearbyDistance = Math.Max(.5m, bar.Atr > 0 ? bar.Atr * .35m : 2m);
+        var nearbyBigTrades = _bigTradeMemory.Near(bar.Close, nearbyDistance).ToArray();
+        foreach (var tracked in nearbyBigTrades)
+        {
+            if (tracked.Disposition == BigTradeDisposition.Trapped)
+            {
+                if (tracked.Event.Side == FlowSide.Sell) { bull += 12; reasons.Add("TRAPPED_SELLER"); }
+                else if (tracked.Event.Side == FlowSide.Buy) { bear += 12; reasons.Add("TRAPPED_BUYER"); }
+            }
+            else if (tracked.Disposition == BigTradeDisposition.Defended)
+            {
+                if (tracked.Event.Side == FlowSide.Buy) { bull += 9; reasons.Add("BIG_BUY_DEFENDED"); }
+                else if (tracked.Event.Side == FlowSide.Sell) { bear += 9; reasons.Add("BIG_SELL_DEFENDED"); }
+            }
+            else if (tracked.Disposition == BigTradeDisposition.InitiativeAccepted)
+            {
+                if (tracked.Event.Side == FlowSide.Buy) { bull += 6; reasons.Add("BIG_BUY_ACCEPTED"); }
+                else if (tracked.Event.Side == FlowSide.Sell) { bear += 6; reasons.Add("BIG_SELL_ACCEPTED"); }
+            }
+        }
+
         bool bullPullback = pullback.IsCounterMove && pullback.ParentDirection == FlowSide.Buy;
         bool bearPullback = pullback.IsCounterMove && pullback.ParentDirection == FlowSide.Sell;
         double pullbackQuality = pullback.Quality;
@@ -88,10 +113,15 @@ public sealed class NarrativeEngine
             if (deltaDiv.Bullish) reload += Math.Min(12, deltaDiv.BullStrength * .12);
             if (value.BullishStall) reload += Math.Min(10, value.Strength * .10);
             if (value.PocDown) damage += 10;
-            if (trades.Any(x => x.Side == FlowSide.Sell && x.PriorPercentile >= .99) && fp.BullAbsorption > .45)
+            if (nearbyBigTrades.Any(x => x.Event.Side == FlowSide.Sell && x.Disposition == BigTradeDisposition.Trapped))
             {
-                reload += 10;
-                reasons.Add("BIG_SELL_ABSORBED_CANDIDATE");
+                reload += 18;
+                reasons.Add("TRAPPED_SELLER_RELOAD");
+            }
+            if (nearbyBigTrades.Any(x => x.Event.Side == FlowSide.Buy && x.Disposition == BigTradeDisposition.Defended))
+            {
+                reload += 12;
+                reasons.Add("BUY_INVENTORY_DEFENDED");
             }
             reload += pullbackQuality * .45;
             damage += Math.Max(0, 100 - pullbackQuality);
@@ -106,17 +136,20 @@ public sealed class NarrativeEngine
             if (deltaDiv.Bearish) reload += Math.Min(12, deltaDiv.BearStrength * .12);
             if (value.BearishStall) reload += Math.Min(10, value.Strength * .10);
             if (value.PocUp) damage += 10;
-            if (trades.Any(x => x.Side == FlowSide.Buy && x.PriorPercentile >= .99) && fp.BearAbsorption > .45)
+            if (nearbyBigTrades.Any(x => x.Event.Side == FlowSide.Buy && x.Disposition == BigTradeDisposition.Trapped))
             {
-                reload += 10;
-                reasons.Add("BIG_BUY_ABSORBED_CANDIDATE");
+                reload += 18;
+                reasons.Add("TRAPPED_BUYER_RELOAD");
+            }
+            if (nearbyBigTrades.Any(x => x.Event.Side == FlowSide.Sell && x.Disposition == BigTradeDisposition.Defended))
+            {
+                reload += 12;
+                reasons.Add("SELL_INVENTORY_DEFENDED");
             }
             reload += pullbackQuality * .45;
             damage += Math.Max(0, 100 - pullbackQuality);
         }
 
-        // Extreme volatility makes a raw pullback classification less trustworthy unless the
-        // auction has already shown rejection/absorption. Penalize rather than hard-veto.
         if (regime.Volatility == VolatilityRegime.Extreme && !auction.BullishFailedAuction && !auction.BearishFailedAuction)
         {
             reload = Math.Max(0, reload - 12);
@@ -180,10 +213,24 @@ public sealed class NarrativeEngine
             : AuctionMode.Balanced;
     }
 
-    private void UpdateZones(BarSnapshot b, FootprintFeatures fp, IReadOnlyList<BigTradeEvent> trades)
+    private void UpdateZones(BarSnapshot b, FootprintFeatures fp, IReadOnlyList<BigTradeEvent> trades, IReadOnlyList<TrackedBigTrade> trackedTrades)
     {
         foreach (var t in trades.Where(x => x.PriorPercentile >= .99))
-            _zones.Add(new(t.Id, ZoneType.BigTrade, t.PriceLow, t.PriceHigh, t.Time, 70, 0, 0, ZoneStatus.Active, t.Side));
+        {
+            if (_zones.All(z => z.Id != t.Id))
+                _zones.Add(new(t.Id, ZoneType.BigTrade, t.PriceLow, t.PriceHigh, t.Time, 70, 0, 0, ZoneStatus.Active, t.Side));
+        }
+
+        foreach (var tracked in trackedTrades)
+        {
+            int index = _zones.FindIndex(z => z.Id == tracked.Event.Id);
+            if (index < 0) continue;
+            var zone = _zones[index];
+            if (tracked.Disposition == BigTradeDisposition.Trapped)
+                _zones[index] = zone with { Status = ZoneStatus.Trapped, Strength = Math.Max(zone.Strength, 80) };
+            else if (tracked.Disposition == BigTradeDisposition.Defended)
+                _zones[index] = zone with { Type = ZoneType.DefendedBigTrade, Status = ZoneStatus.Defended, Strength = Math.Max(zone.Strength, 85) };
+        }
 
         if (fp.BullAbsorption > .65)
             _zones.Add(new(Guid.NewGuid(), ZoneType.Absorption, b.Low, b.Low + Math.Max(.25m, b.Atr * .08m), b.Time, 65, 0, 0, ZoneStatus.Active, FlowSide.Buy));
@@ -194,7 +241,7 @@ public sealed class NarrativeEngine
         {
             var z = _zones[i];
             bool touch = b.Low <= z.High && b.High >= z.Low;
-            if (!touch) continue;
+            if (!touch || z.Status == ZoneStatus.Trapped) continue;
 
             bool holds = z.Owner == FlowSide.Buy ? b.Close >= z.Low : b.Close <= z.High;
             double trend = holds ? z.DefenseResponseTrend + .1 : z.DefenseResponseTrend - .3;
@@ -212,5 +259,5 @@ public sealed class NarrativeEngine
     }
 
     private bool IsInOwnedZone(decimal p, FlowSide side)
-        => _zones.Any(z => z.Owner == side && z.Status != ZoneStatus.Invalidated && p >= z.Low && p <= z.High);
+        => _zones.Any(z => z.Owner == side && z.Status != ZoneStatus.Invalidated && z.Status != ZoneStatus.Trapped && p >= z.Low && p <= z.High);
 }
