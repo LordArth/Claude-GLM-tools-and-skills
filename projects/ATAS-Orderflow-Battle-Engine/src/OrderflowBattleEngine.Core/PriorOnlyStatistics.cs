@@ -12,6 +12,7 @@ public sealed class PriorOnlyStatistics
     public PriorOnlyStatistics(int capacity = 1000) => _capacity = Math.Max(20, capacity);
     public int Count => _values.Count;
     public bool IsWarm(int minimumSamples = 100) => Count >= minimumSamples;
+    public void Reset() => _values.Clear();
 
     public double PercentileOf(double value)
     {
