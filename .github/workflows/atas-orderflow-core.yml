@@ -1,0 +1,26 @@
+name: ATAS Orderflow Core
+
+on:
+  push:
+    paths:
+      - 'projects/ATAS-Orderflow-Battle-Engine/**'
+      - '.github/workflows/atas-orderflow-core.yml'
+  pull_request:
+    paths:
+      - 'projects/ATAS-Orderflow-Battle-Engine/**'
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: projects/ATAS-Orderflow-Battle-Engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build core
+        run: dotnet build src/OrderflowBattleEngine.Core/OrderflowBattleEngine.Core.csproj --configuration Release
+      - name: Run deterministic tests
+        run: dotnet run --project tests/OrderflowBattleEngine.Tests.csproj --configuration Release
